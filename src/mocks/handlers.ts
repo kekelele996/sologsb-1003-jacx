@@ -1,5 +1,5 @@
 import { http, HttpResponse } from 'msw'
-import { analyzeDocument } from '@/lib/markdown'
+import { analyzeDocument, computeContentVersion } from '@/lib/markdown'
 import { seedConflicts, seedDocument, seedHistory } from '@/lib/seed'
 import type { GlossaryTerm, Segment } from '@/lib/types'
 
@@ -12,7 +12,13 @@ export const handlers = [
   http.post('/api/check', async ({ request }) => {
     const body = await request.json() as { segments: Segment[]; glossary: GlossaryTerm[] }
     await new Promise((resolve) => setTimeout(resolve, 320))
-    return HttpResponse.json({ checkedAt: Date.now(), issues: analyzeDocument(body.segments, body.glossary) })
+    const issues = analyzeDocument(body.segments, body.glossary)
+    return HttpResponse.json({
+      checkedAt: Date.now(),
+      contentVersion: computeContentVersion(body.segments, body.glossary),
+      segmentCount: body.segments.length,
+      issues,
+    })
   }),
   http.post('/api/draft', async ({ request }) => {
     const body = await request.json() as { documentId: string; segments: Segment[]; discussions: unknown[] }

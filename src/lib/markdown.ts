@@ -74,5 +74,24 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
 export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[]) =>
   segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary))
 
+/**
+ * 计算参与检查的内容版本指纹。
+ * 只要会影响检查结果的字段（源文、译文、确认状态、术语条目）发生变化，指纹即不同。
+ * 讨论、片段备注与展示状态不参与检查，因此不纳入指纹。
+ */
+export const computeContentVersion = (segments: Segment[], glossary: GlossaryTerm[]): string => {
+  const body = JSON.stringify({
+    segments: segments.map((segment) => [segment.id, segment.sourceText, segment.targetText, segment.status]),
+    glossary: glossary.map((term) => [term.source, term.target, term.caseSensitive]),
+  })
+  // FNV-1a 32 位；非加密场景足够稳定，且结果可复现
+  let hash = 0x811c9dc5
+  for (let index = 0; index < body.length; index += 1) {
+    hash ^= body.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return `v${(hash >>> 0).toString(16).padStart(8, '0')}`
+}
+
 export const renderTargetMarkdown = (segments: Segment[]) =>
   segments.map((segment) => segment.targetText || segment.sourceText).join('\n\n')

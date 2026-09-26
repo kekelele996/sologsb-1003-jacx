@@ -3,10 +3,10 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
-  AlertCircle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronLeft, ChevronRight,
+  AlertCircle, AlertTriangle, ArrowDown, ArrowUp, BookOpen, Check, CheckCheck, ChevronRight,
   CircleAlert, Cloud, CloudOff, Code2, Download, FileText, GitCompare, History, Import,
-  Languages, Link2, Loader2, MessageSquare, RefreshCw, RotateCcw, RotateCw, Save, Search,
-  Send, ShieldCheck, Sparkles, Undo2, UndoDot, Variable, X,
+  Languages, Link2, Loader2, MessageSquare, Pencil, Plus, RefreshCw, RotateCw, Save, Search,
+  Send, ShieldCheck, Sparkles, Trash2, Undo2, UndoDot, Variable, X,
 } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,9 +15,9 @@ import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
-import { analyzeDocument, extractVariables, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
+import { computeContentVersion, parseMarkdown, renderTargetMarkdown } from '@/lib/markdown'
 import { seedConflicts, seedDiscussions, seedDocument, seedGlossary, seedHistory, seedSegments } from '@/lib/seed'
-import type { Discussion, GlossaryTerm, HistoryEntry, Segment, SegmentStatus, TranslationConflict, TranslationIssue } from '@/lib/types'
+import { DOCUMENT_SCOPE, type CheckBatch, type Discussion, type GlossaryTerm, type HistoryEntry, type Segment, type SegmentStatus, type TranslationConflict, type TranslationIssue } from '@/lib/types'
 import { cn } from '@/lib/utils'
 
 const DRAFT_KEY = 'sologsb-1003-localization-draft-v1'
@@ -31,6 +31,10 @@ const statusClass: Record<SegmentStatus, string> = {
 const issueLabel: Record<TranslationIssue['type'], string> = {
   'missing-translation': '漏译', 'missing-variable': '变量缺失', 'link-mismatch': '链接不一致', glossary: '术语不一致', 'code-format': '代码格式',
 }
+const historyActionLabel: Record<HistoryEntry['action'], string> = {
+  edit: '编辑译文', confirm: '确认', return: '退回', 'resolve-conflict': '解决冲突', import: '导入文档', discussion: '添加讨论', check: '运行检查',
+}
+const checkIssueLabel = (count?: number) => typeof count === 'number' ? count ? `发现 ${count} 个问题` : '检查通过' : ''
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T
 
 interface EditorSnapshot {
@@ -40,12 +44,16 @@ interface EditorSnapshot {
 
 export function LocalizationWorkbench() {
   const fileInput = useRef<HTMLInputElement>(null)
+  const requestedContentVersionRef = useRef<string | null>(null)
   const [segments, setSegments] = useState<Segment[]>(seedSegments)
   const [glossary, setGlossary] = useState<GlossaryTerm[]>(seedGlossary)
   const [discussions, setDiscussions] = useState<Discussion[]>(seedDiscussions)
   const [history, setHistory] = useState<HistoryEntry[]>(seedHistory)
   const [conflicts, setConflicts] = useState<TranslationConflict[]>(seedConflicts)
-  const [checkedIssues, setCheckedIssues] = useState<TranslationIssue[] | null>(null)
+  const [checkBatches, setCheckBatches] = useState<CheckBatch[]>([])
+  const [showStaleBatches, setShowStaleBatches] = useState(false)
+  const [glossaryDraft, setGlossaryDraft] = useState<{ source: string; target: string; note: string }>({ source: '', target: '', note: '' })
+  const [editingTermId, setEditingTermId] = useState<string | null>(null)
   const [selectedSegmentId, setSelectedSegmentId] = useState('seg-05')
   const [mode, setMode] = useState<'translate' | 'review'>('translate')
   const [filter, setFilter] = useState<'all' | 'issues' | 'untranslated' | 'confirmed'>('all')
@@ -88,13 +96,27 @@ export function LocalizationWorkbench() {
 
   const checkMutation = useMutation({
     mutationFn: async () => {
+      requestedContentVersionRef.current = computeContentVersion(segments, glossary)
       const response = await fetch('/api/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ segments, glossary }) })
       if (!response.ok) throw new Error('check failed')
-      return response.json() as Promise<{ checkedAt: number; issues: TranslationIssue[] }>
+      return response.json() as Promise<{ checkedAt: number; contentVersion: string; segmentCount: number; issues: TranslationIssue[] }>
     },
     onSuccess: (data) => {
-      setCheckedIssues(data.issues)
-      setFilter('issues')
+      // 以发请求时的内容版本为准：若请求往返期间正文/术语表又被改动，本批次立即按过期存档
+      const requestedVersion = requestedContentVersionRef.current
+      const batch: CheckBatch = {
+        id: `check-${data.checkedAt}-${Math.random().toString(36).slice(2, 6)}`,
+        contentVersion: requestedVersion ?? data.contentVersion,
+        checkedAt: data.checkedAt,
+        issues: data.issues,
+        issueCount: data.issues.length,
+        segmentCount: data.segmentCount,
+      }
+      setCheckBatches((current) => [batch, ...current])
+      setShowStaleBatches(false)
+      pushCheckHistory(batch)
+      // 只有批次确实对应当前内容时，才跳到“问题”视图
+      if (requestedVersion === contentVersion) setFilter('issues')
     },
   })
   const saveMutation = useMutation({
@@ -105,7 +127,7 @@ export function LocalizationWorkbench() {
     },
     onSuccess: () => {
       setDirty(false)
-      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, checkBatches })) } catch { /* storage may be unavailable */ }
     },
   })
   const reviewMutation = useMutation({
@@ -116,8 +138,15 @@ export function LocalizationWorkbench() {
     },
   })
 
-  const liveIssues = useMemo(() => analyzeDocument(segments, glossary), [segments, glossary])
-  const issues = checkedIssues ?? liveIssues
+  // 当前正文 + 术语表的内容版本；正文或术语表一动，指纹立即变化
+  const contentVersion = useMemo(() => computeContentVersion(segments, glossary), [segments, glossary])
+  // 最新一次检查批次；它绑定的版本决定结果是否仍对应当前内容
+  const latestBatch = checkBatches[0] ?? null
+  const isLatestCheckFresh = latestBatch?.contentVersion === contentVersion
+  const activeBatch: CheckBatch | null = isLatestCheckFresh ? latestBatch : null
+  // 只展示“本次版本检查”生成的问题；旧批次的问题不会混进导航、筛选或片段高亮
+  const issues: TranslationIssue[] = activeBatch?.issues ?? []
+  const staleBatches = useMemo(() => checkBatches.filter((batch) => batch.contentVersion !== contentVersion), [checkBatches, contentVersion])
   const issueMap = useMemo(() => issues.reduce<Record<string, TranslationIssue[]>>((map, issue) => {
     map[issue.segmentId] = [...(map[issue.segmentId] ?? []), issue]
     return map
@@ -142,12 +171,13 @@ export function LocalizationWorkbench() {
     try {
       const raw = localStorage.getItem(DRAFT_KEY)
       if (raw) {
-        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[] }
+        const draft = JSON.parse(raw) as { segments: Segment[]; discussions: Discussion[]; glossary: GlossaryTerm[]; history: HistoryEntry[]; checkBatches?: CheckBatch[] }
         if (draft.segments?.length) {
           setSegments(draft.segments)
           setDiscussions(draft.discussions ?? seedDiscussions)
           setGlossary(draft.glossary ?? seedGlossary)
           setHistory(draft.history ?? seedHistory)
+          setCheckBatches(draft.checkBatches ?? [])
         }
       }
     } catch { /* start from seed */ }
@@ -156,8 +186,13 @@ export function LocalizationWorkbench() {
 
   useEffect(() => {
     if (!hydrated) return
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history })) } catch { /* storage may be unavailable */ }
-  }, [discussions, glossary, history, hydrated, segments])
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ segments, discussions, glossary, history, checkBatches })) } catch { /* storage may be unavailable */ }
+  }, [checkBatches, discussions, glossary, history, hydrated, segments])
+
+  // 内容改动使最新检查过期时，离开“问题”筛选，避免过期清单清空后正文区一片空白
+  useEffect(() => {
+    if (filter === 'issues' && latestBatch && !isLatestCheckFresh) setFilter('all')
+  }, [filter, isLatestCheckFresh, latestBatch])
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -173,12 +208,20 @@ export function LocalizationWorkbench() {
   const pushHistoryEntry = (segmentId: string, action: HistoryEntry['action'], before: string, after: string, author = '当前用户') => {
     setHistory((current) => [{ id: `history-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, segmentId, author, action, before, after, createdAt: Date.now() }, ...current])
   }
+  // 检查批次写入历史：记录绑定版本与问题数；是否过期在渲染时与当前版本实时比对
+  const pushCheckHistory = (batch: CheckBatch) => {
+    const entry: HistoryEntry = {
+      id: `history-${batch.id}`, segmentId: DOCUMENT_SCOPE, author: '当前用户', action: 'check',
+      before: '', after: batch.issueCount ? `发现 ${batch.issueCount} 个问题` : '检查通过，未发现问题',
+      createdAt: batch.checkedAt, checkContentVersion: batch.contentVersion, checkIssueCount: batch.issueCount,
+    }
+    setHistory((current) => [entry, ...current])
+  }
   const replaceState = (next: EditorSnapshot, markDirty = true) => {
     setPast((current) => [...current.slice(-49), snapshot()])
     setFuture([])
     setSegments(next.segments)
     setDiscussions(next.discussions)
-    setCheckedIssues(null)
     if (markDirty) setDirty(true)
   }
   const updateTarget = (segment: Segment, targetText: string) => {
@@ -200,7 +243,6 @@ export function LocalizationWorkbench() {
     setPast((current) => current.slice(0, -1))
     setSegments(previous.segments)
     setDiscussions(previous.discussions)
-    setCheckedIssues(null)
     setDirty(true)
   }
   const redo = () => {
@@ -210,12 +252,23 @@ export function LocalizationWorkbench() {
     setFuture((current) => current.slice(1))
     setSegments(next.segments)
     setDiscussions(next.discussions)
-    setCheckedIssues(null)
     setDirty(true)
+  }
+  const scrollToSegment = (segmentId: string, attempt = 0) => {
+    const element = document.getElementById(`segment-${segmentId}`)
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      return
+    }
+    // 切换筛选后片段可能下一帧才挂载，最多再等两帧
+    if (attempt < 2) requestAnimationFrame(() => scrollToSegment(segmentId, attempt + 1))
   }
   const selectAndScroll = (segmentId: string) => {
     setSelectedSegmentId(segmentId)
-    requestAnimationFrame(() => document.getElementById(`segment-${segmentId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' }))
+    const visible = segments.some((segment) => segment.id === segmentId)
+      && filteredSegments.some((segment) => segment.id === segmentId)
+    if (!visible && filter !== 'all') setFilter('all')
+    requestAnimationFrame(() => scrollToSegment(segmentId))
   }
   const nextIssue = (direction: 1 | -1 = 1) => {
     const ids = Array.from(new Set(issues.map((issue) => issue.segmentId)))
@@ -259,7 +312,22 @@ export function LocalizationWorkbench() {
     event.target.value = ''
   }
   const exportMarkdown = () => {
-    const blob = new Blob([renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
+    const checkedAtLabel = latestBatch ? new Date(latestBatch.checkedAt).toLocaleString('zh-CN') : '从未运行检查'
+    const checkStatusLine = isLatestCheckFresh
+      ? `检查状态：已按最新内容检查（${checkedAtLabel}），本次发现 ${latestBatch?.issueCount ?? 0} 个问题。`
+      : latestBatch
+        ? `检查状态：存在过期检查（${checkedAtLabel}，${latestBatch.issueCount} 个问题），正文或术语表之后已修改，请重新检查后再交付。`
+        : '检查状态：尚未运行本地术语检查。'
+    const header = [
+      '<!--',
+      `  导出文件：${documentQuery.data.sourceFile} → 简体中文`,
+      `  导出时间：${new Date().toLocaleString('zh-CN')}`,
+      `  内容版本：${contentVersion}`,
+      `  ${checkStatusLine}`,
+      '-->',
+      '',
+    ].join('\n')
+    const blob = new Blob([header + renderTargetMarkdown(segments)], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
@@ -273,6 +341,30 @@ export function LocalizationWorkbench() {
       next.has(segmentId) ? next.delete(segmentId) : next.add(segmentId)
       return next
     })
+  }
+  // 术语表改动会改变内容版本，最近一次检查自动变为“需重查”
+  const saveGlossaryTerm = () => {
+    const source = glossaryDraft.source.trim()
+    const target = glossaryDraft.target.trim()
+    if (!source || !target) return
+    if (editingTermId) {
+      setGlossary((current) => current.map((term) => term.id === editingTermId ? { ...term, source, target, note: glossaryDraft.note.trim() } : term))
+    } else {
+      const term: GlossaryTerm = { id: `term-${Date.now()}`, source, target, caseSensitive: false, note: glossaryDraft.note.trim() }
+      setGlossary((current) => [...current, term])
+    }
+    setGlossaryDraft({ source: '', target: '', note: '' })
+    setEditingTermId(null)
+    setDirty(true)
+  }
+  const startEditTerm = (term: GlossaryTerm) => {
+    setEditingTermId(term.id)
+    setGlossaryDraft({ source: term.source, target: term.target, note: term.note })
+  }
+  const removeGlossaryTerm = (termId: string) => {
+    setGlossary((current) => current.filter((term) => term.id !== termId))
+    if (editingTermId === termId) { setEditingTermId(null); setGlossaryDraft({ source: '', target: '', note: '' }) }
+    setDirty(true)
   }
 
   useEffect(() => {
@@ -319,10 +411,11 @@ export function LocalizationWorkbench() {
         <div className="mx-auto flex max-w-[1800px] flex-wrap items-center gap-x-6 gap-y-2 text-xs text-slate-600">
           <span><b className="text-slate-900">{segments.length}</b> 个内容块</span>
           <span><b className="text-slate-900">{translatedCount}</b> 已翻译</span>
-          <span className="flex items-center gap-1"><CircleAlert className="h-3.5 w-3.5 text-amber-600" /><b className="text-slate-900">{issues.length}</b> 个检查结果</span>
+          <span className="flex items-center gap-1"><CircleAlert className={cn('h-3.5 w-3.5', activeBatch ? (issues.length ? 'text-amber-600' : 'text-emerald-600') : 'text-slate-400')} /><b className="text-slate-900">{activeBatch ? issues.length : '—'}</b> 个检查结果</span>
+          {latestBatch && <span className="flex items-center gap-1" title={`检查批次 ${latestBatch.id} · 绑定版本 ${latestBatch.contentVersion}`}>{isLatestCheckFresh ? <CheckCheck className="h-3.5 w-3.5 text-emerald-600" /> : <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />}<span className={isLatestCheckFresh ? 'text-emerald-700' : 'text-amber-700'}>{isLatestCheckFresh ? '检查为最新' : '检查已过期，需重查'}</span></span>}
           <span className="flex items-center gap-1"><CheckCheck className="h-3.5 w-3.5 text-emerald-600" /><b className="text-slate-900">{confirmedCount}</b> 已确认</span>
           <div className="ml-auto flex min-w-[220px] items-center gap-3"><span>审校进度 {progress}%</span><Progress value={progress} className="w-36" /></div>
-          <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}运行本地术语检查</Button>
+          <Button size="sm" variant="secondary" onClick={() => checkMutation.mutate()} disabled={checkMutation.isPending}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}{latestBatch ? '重新运行检查' : '运行本地术语检查'}</Button>
           <Button size="sm" variant="outline" onClick={exportMarkdown}><Download className="h-4 w-4" />导出译文</Button>
         </div>
       </div>
@@ -332,18 +425,38 @@ export function LocalizationWorkbench() {
           <Card>
             <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><BookOpen className="h-4 w-4 text-blue-600" />本地术语表 <Badge variant="secondary">{glossary.length}</Badge></CardTitle><div className="relative mt-2"><Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-slate-400" /><Input value={glossarySearch} onChange={(event) => setGlossarySearch(event.target.value)} placeholder="搜索术语" className="h-9 pl-8 text-xs" /></div></CardHeader>
             <CardContent className="space-y-2">
-              {filteredGlossary.map((term) => <div key={term.id} className="rounded-lg border bg-slate-50/70 p-2.5"><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p></div>)}
+              <div className="rounded-lg border border-blue-200 bg-blue-50/60 p-2.5">
+                <p className="mb-2 text-[10px] font-semibold text-blue-800">{editingTermId ? '编辑术语（保存后旧检查将过期）' : '新增术语（保存后旧检查将过期）'}</p>
+                <div className="flex gap-1.5"><Input value={glossaryDraft.source} onChange={(event) => setGlossaryDraft((current) => ({ ...current, source: event.target.value }))} placeholder="源文，如 pod" className="h-8 text-xs" /><Input value={glossaryDraft.target} onChange={(event) => setGlossaryDraft((current) => ({ ...current, target: event.target.value }))} placeholder="译文，如 Pod" className="h-8 text-xs" /></div>
+                <Input value={glossaryDraft.note} onChange={(event) => setGlossaryDraft((current) => ({ ...current, note: event.target.value }))} placeholder="备注（可选）" className="mt-1.5 h-8 text-xs" />
+                <div className="mt-2 flex gap-1.5"><Button size="sm" className="h-7 flex-1 text-xs" disabled={!glossaryDraft.source.trim() || !glossaryDraft.target.trim()} onClick={saveGlossaryTerm}><Plus className="h-3.5 w-3.5" />{editingTermId ? '保存' : '添加'}</Button>{editingTermId && <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => { setEditingTermId(null); setGlossaryDraft({ source: '', target: '', note: '' }) }}>取消</Button>}</div>
+              </div>
+              {filteredGlossary.map((term) => <div key={term.id} className={cn('rounded-lg border p-2.5', editingTermId === term.id ? 'border-blue-300 bg-blue-50' : 'bg-slate-50/70')}><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-800">{term.source}</span><ChevronRight className="h-3.5 w-3.5 text-slate-400" /><span className="text-xs font-semibold text-blue-700">{term.target}</span></div><p className="mt-1 text-[10px] leading-relaxed text-slate-500">{term.note}</p><div className="mt-1.5 flex justify-end gap-1"><button className="rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700" title="编辑术语" onClick={() => startEditTerm(term)}><Pencil className="h-3 w-3" /></button><button className="rounded p-1 text-slate-400 hover:bg-red-100 hover:text-red-600" title="删除术语" onClick={() => removeGlossaryTerm(term.id)}><Trash2 className="h-3 w-3" /></button></div></div>)}
+              {!filteredGlossary.length && <p className="py-3 text-center text-[11px] text-slate-400">没有匹配的术语</p>}
             </CardContent>
           </Card>
 
           <Card>
-            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><AlertCircle className="h-4 w-4 text-amber-600" />问题导航 <Badge variant={issues.length ? 'warning' : 'success'}>{issues.length}</Badge></CardTitle></CardHeader>
+            <CardHeader className="pb-3"><CardTitle className="flex items-center gap-2 text-sm"><AlertCircle className="h-4 w-4 text-amber-600" />问题导航 <Badge variant={activeBatch && issues.length ? 'warning' : 'success'}>{activeBatch ? issues.length : 0}</Badge>{activeBatch && <span className="ml-auto text-[10px] font-normal text-slate-400">{new Date(activeBatch.checkedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · {activeBatch.contentVersion}</span>}</CardTitle></CardHeader>
             <CardContent className="space-y-2">
-              {issues.slice(0, 14).map((issue) => {
+              {!latestBatch && <div className="rounded-lg border border-blue-200 bg-blue-50 p-3 text-[11px] leading-relaxed text-blue-700"><ShieldCheck className="mb-1 h-4 w-4" />还没有检查记录，点击顶部“运行本地术语检查”生成本版本的问题清单。</div>}
+              {latestBatch && !isLatestCheckFresh && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3">
+                  <div className="flex items-start gap-2"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" /><div className="min-w-0"><p className="text-[11px] font-semibold text-amber-800">检查结果已过期，需要重查</p><p className="mt-1 text-[10px] leading-relaxed text-amber-700">正文或术语表在检查后被修改（当前版本 {contentVersion}，检查版本 {latestBatch.contentVersion}）。旧清单已收起，避免按过期问题确认。</p></div></div>
+                  <Button size="sm" className="mt-2.5 w-full bg-amber-600 hover:bg-amber-700" disabled={checkMutation.isPending} onClick={() => checkMutation.mutate()}>{checkMutation.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}按当前内容重新检查</Button>
+                </div>
+              )}
+              {activeBatch && issues.slice(0, 14).map((issue) => {
                 const segment = segments.find((item) => item.id === issue.segmentId)
-                return <button key={issue.id} className={cn('w-full rounded-lg border p-2.5 text-left transition hover:border-blue-300 hover:bg-blue-50', selectedSegmentId === issue.segmentId && 'border-blue-300 bg-blue-50')} onClick={() => selectAndScroll(issue.segmentId)}><div className="flex items-center justify-between gap-2"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segment?.index}</span></div><p className="mt-1.5 text-[11px] leading-relaxed text-slate-600">{issue.message}</p></button>
+                return <button key={issue.id} className={cn('w-full rounded-lg border p-2.5 text-left transition hover:border-blue-300 hover:bg-blue-50', selectedSegmentId === issue.segmentId && 'border-blue-300 bg-blue-50')} onClick={() => selectAndScroll(issue.segmentId)}><div className="flex items-center justify-between gap-2"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segment?.index ?? '—'}</span></div><p className="mt-1.5 text-[11px] leading-relaxed text-slate-600">{issue.message}</p></button>
               })}
-              {!issues.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有检查已通过</div>}
+              {activeBatch && !issues.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />本次检查已通过</div>}
+              {!!staleBatches.length && (
+                <div className="border-t pt-2">
+                  <button className="flex w-full items-center gap-1.5 text-[10px] font-medium text-slate-500 hover:text-slate-700" onClick={() => setShowStaleBatches((value) => !value)}><History className="h-3.5 w-3.5" />{showStaleBatches ? '收起' : '查看'}过期检查（{staleBatches.length}）<ChevronRight className={cn('h-3 w-3 transition', showStaleBatches && 'rotate-90')} /></button>
+                  {showStaleBatches && <div className="mt-2 space-y-1.5">{staleBatches.map((batch) => <div key={batch.id} className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-2 text-[10px] text-slate-50"><div className="flex items-center justify-between"><Badge variant="warning" className="text-[9px]">已过期</Badge><span>{new Date(batch.checkedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}</span></div><p className="mt-1">版本 {batch.contentVersion} · {batch.issueCount} 个问题 · {batch.segmentCount} 个片段</p><p className="mt-0.5 text-slate-400">仅作存档，不参与当前导航与确认。</p></div>)}</div>}
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -364,6 +477,14 @@ export function LocalizationWorkbench() {
             </div>
             <div className="ml-auto flex items-center gap-2 text-xs text-slate-500"><span>{filteredSegments.length} / {segments.length}</span><Button variant="outline" size="sm" onClick={() => nextIssue(-1)}><ArrowUp className="h-3.5 w-3.5" />上一问题</Button><Button variant="outline" size="sm" onClick={() => nextIssue(1)}>下一问题<ArrowDown className="h-3.5 w-3.5" /></Button></div>
           </div>
+
+          {latestBatch && !isLatestCheckFresh && (
+            <div className="flex flex-wrap items-center gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-xs text-amber-800 shadow-sm">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
+              <span>检查结果基于 <b>{latestBatch.contentVersion}</b>，正文或术语表已修改（当前 <b>{contentVersion}</b>）。旧问题清单已收起，审校前请重新检查。</span>
+              <Button size="sm" className="ml-auto h-7 bg-amber-600 hover:bg-amber-700" disabled={checkMutation.isPending} onClick={() => checkMutation.mutate()}>{checkMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新检查</Button>
+            </div>
+          )}
 
           {filteredSegments.map((segment) => {
             const segmentIssues = issueMap[segment.id] ?? []
@@ -411,8 +532,12 @@ export function LocalizationWorkbench() {
                 <div className="mt-3 flex gap-2"><Textarea value={discussionDraft} onChange={(event) => setDiscussionDraft(event.target.value)} rows={2} placeholder="针对当前句子留下讨论…" className="text-xs" /><Button size="icon" className="h-auto self-stretch" onClick={addDiscussion}><Send className="h-4 w-4" /></Button></div>
                 <div className="mt-4 space-y-3">{selectedDiscussions.map((discussion) => <div key={discussion.id} className="rounded-lg border p-3"><div className="flex items-center justify-between"><b className="text-xs text-slate-800">{discussion.author}</b><Badge variant={discussion.resolved ? 'success' : 'warning'}>{discussion.resolved ? '已解决' : '待回应'}</Badge></div><p className="mt-2 text-xs leading-5 text-slate-600">{discussion.body}</p><p className="mt-2 text-[10px] text-slate-400">{hydrated ? new Date(discussion.createdAt).toLocaleString('zh-CN') : null}</p></div>)}{!selectedDiscussions.length && <p className="py-8 text-center text-xs text-slate-400">当前片段还没有讨论</p>}</div>
               </TabsContent>
-              <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>)}{!issues.length && <p className="py-8 text-center text-xs text-emerald-600">没有待处理问题</p>}</div></TabsContent>
-              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className="absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white bg-blue-500" /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {entry.action}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</div>)}</div></TabsContent>
+              <TabsContent value="issues" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-2">{latestBatch && !isLatestCheckFresh && <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-[11px] leading-relaxed text-amber-800"><div className="flex items-center gap-1.5 font-semibold"><AlertTriangle className="h-3.5 w-3.5" />当前清单已过期</div><p className="mt-1">以下为检查版本 {latestBatch.contentVersion} 的结果，正文或术语表之后已修改。请重新检查，避免按旧问题处理。</p><Button size="sm" className="mt-2 h-7 w-full bg-amber-600 hover:bg-amber-700" disabled={checkMutation.isPending} onClick={() => checkMutation.mutate()}>{checkMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}重新检查</Button></div>}{activeBatch ? issues.map((issue) => <button key={issue.id} onClick={() => selectAndScroll(issue.segmentId)} className="w-full rounded-lg border p-3 text-left hover:border-amber-300 hover:bg-amber-50"><div className="flex items-center justify-between"><Badge variant={issue.severity === 'error' ? 'destructive' : 'warning'}>{issueLabel[issue.type]}</Badge><span className="text-[10px] text-slate-400">#{segments.find((item) => item.id === issue.segmentId)?.index ?? '—'}</span></div><p className="mt-2 text-xs leading-5 text-slate-600">{issue.message}</p></button>) : <p className="py-8 text-center text-xs text-slate-400">{latestBatch ? '检查已过期，请重新检查后查看当前版本问题' : '尚未运行检查'}</p>}{activeBatch && !issues.length && <p className="py-8 text-center text-xs text-emerald-600">本次检查没有待处理问题</p>}</div></TabsContent>
+              <TabsContent value="history" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-0">{history.map((entry) => {
+                const checkFresh = entry.action === 'check' && entry.checkContentVersion === contentVersion
+                const checkStale = entry.action === 'check' && entry.checkContentVersion !== contentVersion
+                return <div key={entry.id} className="relative border-l border-slate-200 pb-4 pl-4"><span className={cn('absolute -left-1.5 top-0 h-3 w-3 rounded-full border-2 border-white', entry.action === 'check' ? (checkFresh ? 'bg-emerald-500' : 'bg-amber-500') : 'bg-blue-500')} /><div className="flex items-center justify-between"><b className="text-[11px] text-slate-700">{entry.author}</b><span className="text-[9px] text-slate-400">{hydrated ? new Date(entry.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : null}</span></div>{entry.action === 'check' ? <div className="mt-1"><p className="text-[10px] font-medium text-slate-600">运行检查批次 · {checkIssueLabel(entry.checkIssueCount)}</p><p className="mt-0.5 text-[10px] text-slate-400">绑定版本 {entry.checkContentVersion}</p><Badge variant={checkFresh ? 'success' : 'warning'} className="mt-1 text-[9px]">{checkFresh ? '当前版本' : '已过期，需重查'}</Badge></div> : <><p className="mt-1 text-[10px] text-slate-500">片段 #{segments.find((item) => item.id === entry.segmentId)?.index ?? '—'} · {historyActionLabel[entry.action]}</p>{entry.after && <p className="mt-1 line-clamp-2 text-[10px] leading-4 text-slate-400">{entry.after}</p>}</>}</div>
+              })}</div></TabsContent>
               <TabsContent value="conflicts" className="m-0 max-h-[calc(100vh-160px)] overflow-auto p-3"><div className="space-y-3">{conflicts.map((conflict) => <div key={conflict.id} className="overflow-hidden rounded-lg border border-red-200"><div className="bg-red-50 px-3 py-2"><b className="text-xs text-red-800">片段 #{segments.find((item) => item.id === conflict.segmentId)?.index} 存在并发修改</b><p className="mt-1 text-[10px] text-red-600">{conflict.remoteAuthor} 修改了同一句</p></div><div className="space-y-2 p-3"><div><span className="text-[9px] font-semibold text-slate-400">本地版本</span><p className="mt-1 text-[11px] leading-5 text-slate-600">{conflict.localText}</p></div><div><span className="text-[9px] font-semibold text-slate-400">远端版本</span><p className="mt-1 text-[11px] leading-5 text-blue-700">{conflict.remoteText}</p></div><div className="flex gap-2"><Button size="sm" variant="outline" onClick={() => resolveConflict(conflict, 'local')}>保留本地</Button><Button size="sm" onClick={() => resolveConflict(conflict, 'remote')}>采用远端</Button></div></div></div>)}{!conflicts.length && <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 text-center text-xs text-emerald-700"><Check className="mx-auto mb-2 h-5 w-5" />所有冲突已解决</div>}</div></TabsContent>
             </Tabs>
           </Card>
