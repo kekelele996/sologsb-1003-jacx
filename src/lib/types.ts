@@ -40,14 +40,25 @@ export interface TranslationIssue {
   expected?: string
 }
 
+export interface CheckBatch {
+  id: string
+  /** 运行检查时正文与术语表的内容版本指纹 */
+  contentVersion: string
+  checkedAt: number
+  issueCount: number
+  issues: TranslationIssue[]
+}
+
 export interface HistoryEntry {
   id: string
   segmentId: string
   author: string
-  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion'
+  action: 'edit' | 'confirm' | 'return' | 'resolve-conflict' | 'import' | 'discussion' | 'check'
   before: string
   after: string
   createdAt: number
+  /** 检查批次历史关联的批次 ID */
+  batchId?: string
 }
 
 export interface TranslationConflict {

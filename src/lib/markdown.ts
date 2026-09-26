@@ -74,5 +74,29 @@ export const analyzeSegment = (segment: Segment, glossary: GlossaryTerm[]): Tran
 export const analyzeDocument = (segments: Segment[], glossary: GlossaryTerm[]) =>
   segments.flatMap((segment) => segment.status === 'confirmed' ? [] : analyzeSegment(segment, glossary))
 
+/** FNV-1a 32 位哈希，用于为正文/术语表内容生成稳定的短版本指纹 */
+const fnv1a = (input: string) => {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+/**
+ * 计算正文与术语表的内容版本：只要任一片段的源文/译文/状态，
+ * 或术语条目发生变化，版本指纹就会改变；讨论不影响检查结果，不计入。
+ */
+export const contentFingerprint = (segments: Segment[], glossary: GlossaryTerm[]) => {
+  const segmentPart = segments
+    .map((segment) => [segment.id, segment.sourceText, segment.targetText, segment.status].join(''))
+    .join('')
+  const glossaryPart = glossary
+    .map((term) => [term.id, term.source, term.target, term.caseSensitive ? '1' : '0'].join(''))
+    .join('')
+  return `seg-${fnv1a(segmentPart)}-glo-${fnv1a(glossaryPart)}`
+}
+
 export const renderTargetMarkdown = (segments: Segment[]) =>
   segments.map((segment) => segment.targetText || segment.sourceText).join('\n\n')
